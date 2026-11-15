@@ -1,0 +1,29 @@
+[package]
+name = "rig-fleet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Operate a personal NixOS and nix-darwin fleet"
+
+[lib]
+name = "rig"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rig"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+hostname = "0.4"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+signal-hook = "0.3"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
+uuid = { version = "1", features = ["v4"] }
