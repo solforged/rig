@@ -48,6 +48,7 @@
               clippy
               jujutsu
               git
+              nh
             ];
           };
         }

@@ -108,8 +108,9 @@ pub fn store_path(path: &str) -> Result<&str> {
             && tail.as_bytes()[..32.min(tail.len())]
                 .iter()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            && !tail.contains('/')
-            && !tail.chars().any(char::is_whitespace),
+            && tail.as_bytes()[33..]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"+-._?=".contains(c)),
         format!("backend returned an invalid store path: {path:?}"),
     )?;
     Ok(path)

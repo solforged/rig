@@ -17,6 +17,28 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::runtime(format!("backend omitted {name}")))
 }
+/// Hand the already-built closure to the native backend without reevaluating a flake.
+pub fn activation_invocation(platform: &Platform, closure: &str) -> Result<Invocation> {
+    store_path(closure)?;
+    let command = match platform {
+        Platform::Darwin => Invocation::new([
+            "nh",
+            "darwin",
+            "switch",
+            "--expr",
+            &format!("{{ config.system.build.toplevel = builtins.storePath \"{closure}\"; }}"),
+            "--impure",
+            "--diff",
+            "always",
+            "--no-nom",
+        ]),
+        Platform::Nixos => Invocation::new([
+            "nh", "os", "switch", closure, "--diff", "always", "--no-nom",
+        ]),
+    };
+    Ok(command.stream(Stream::Progress).unlimited())
+}
+
 impl<'a> Operations<'a> {
     pub fn new(
         flake: PathBuf,
@@ -280,8 +302,13 @@ impl<'a> Operations<'a> {
             .run(Invocation::new(["nh", backend, "switch", "--help"]))?
             .stdout;
         require(
-            help.contains("Path or symlink to a /nix/store path") && help.contains("--diff"),
-            "installed nh does not advertise exact-store-path activation",
+            help.contains("--diff")
+                && if host.platform == Platform::Darwin {
+                    help.contains("--expr") && help.contains("--impure")
+                } else {
+                    help.contains("Path or symlink to a /nix/store path")
+                },
+            "installed nh does not advertise the required exact-closure activation inputs",
         )?;
         if dry {
             return Ok(json!({"host": name, "dryRun": true, "flake": self.flake,
@@ -295,6 +322,7 @@ impl<'a> Operations<'a> {
         let built = self.build(name, host)?;
         let comparison = self.diff(name, host, &built)?;
         let closure = field(&built, "closure")?.to_string();
+        let command = activation_invocation(&host.platform, &closure)?;
         progress(format!(
             "{name}: candidate {closure}\n{}",
             comparison["diff"].as_str().unwrap_or("")
@@ -304,13 +332,7 @@ impl<'a> Operations<'a> {
         record["state"] = json!("activating");
         record["startedAt"] = json!(now());
         self.state.write(&format!("hosts/{name}.json"), &record)?;
-        let activation = self.runner.run(
-            Invocation::new([
-                "nh", backend, "switch", &closure, "--diff", "always", "--no-nom",
-            ])
-            .stream(Stream::Progress)
-            .unlimited(),
-        );
+        let activation = self.runner.run(command);
         let active = self.active(name, host);
         if activation.is_err() || active.as_ref().ok().and_then(|v| v.as_deref()) != Some(&closure)
         {

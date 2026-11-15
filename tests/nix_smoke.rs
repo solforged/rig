@@ -86,3 +86,32 @@ fn freezes_and_roots_a_real_nix_build() {
         closure
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Nix and nh; builds a text-file fixture, never activates"]
+fn darwin_handoff_preserves_the_exact_built_closure() {
+    let (temp, flake) = fixture();
+    let inventory = Inventory::load(&NativeRunner, &flake).unwrap();
+    let ops = Operations {
+        flake,
+        inventory,
+        runner: &NativeRunner,
+        state: State::new(temp.path().join("state")).unwrap(),
+        names: BTreeSet::from(["local".into()]),
+        current_system: temp.path().join("never-used"),
+    };
+    let built = ops.build("local", &ops.inventory.hosts["local"]).unwrap();
+    let closure = built["closure"].as_str().unwrap();
+    let mut command = rig::system::activation_invocation(&Platform::Darwin, closure).unwrap();
+    // Build and switch share nh's installable resolver; build cannot activate.
+    command.argv[2] = "build".into();
+    let diff = command.argv.iter().position(|arg| arg == "--diff").unwrap();
+    command.argv[diff + 1] = "never".into();
+    let result = temp.path().join("native-result");
+    command
+        .argv
+        .extend(["--out-link".into(), result.to_string_lossy().into_owned()]);
+    NativeRunner.run(command).unwrap();
+    assert_eq!(fs::read_link(result).unwrap().to_string_lossy(), closure);
+}

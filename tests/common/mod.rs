@@ -100,7 +100,7 @@ impl Runner for FakeRunner {
         let mut code = 0;
         if a[0] == "nh" {
             if a.contains(&"--help".into()) {
-                stdout = "Path or symlink to a /nix/store path --diff".into();
+                stdout = "Path or symlink to a /nix/store path --expr --impure --diff".into();
             } else {
                 *self.active.lock().unwrap() = Some(self.after_switch.lock().unwrap().clone());
                 if *self.switch_fails.lock().unwrap() {

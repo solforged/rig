@@ -81,11 +81,16 @@ fn unknown_local_name_requires_target() {
 #[test]
 fn store_paths_are_validated() {
     assert!(store_path(CLOSURE).is_ok());
+    assert!(store_path(&format!("{CLOSURE}+A._?=-1")).is_ok());
     for path in [
         "/etc/passwd",
         "-bad",
         "/nix/store/a-system",
         &format!("{CLOSURE}/bin/tool"),
+        &format!("{CLOSURE}\""),
+        &format!("{CLOSURE}${{injection}}"),
+        &format!("{CLOSURE};"),
+        &format!("{CLOSURE}\\"),
     ] {
         assert!(store_path(path).is_err());
     }

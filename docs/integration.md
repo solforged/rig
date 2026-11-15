@@ -118,7 +118,8 @@ workspaces in temporary repositories. It covers activation failures, concurrent
 source edits, cleanup boundaries, partial fleet observations, model integrity,
 and task lifecycle. The Nix package runs these tests in its build environment.
 Opt-in native Nix tests check pure root-output evaluation and a rooted text-file
-build through the real CLI protocol; they never activate that fixture.
+build through the real CLI protocol. On Darwin they also hand that exact output
+to real `nh` using its build-only path; they never activate that fixture.
 
 Native mutation smoke tests still need separate approval on each platform.
 A successful fake-backend test does not establish that an OS activation or

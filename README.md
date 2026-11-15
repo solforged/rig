@@ -7,8 +7,8 @@ and foreground tasks with private run history.
 
 Remote mutations, generation pruning, rollback, enrollment, secret editing,
 and detached tasks are not enabled. The CLI reports these limits before making
-changes. Native activation adapters have fake-backend tests, not live-machine
-switch tests.
+changes. Native activation adapters have fake-backend tests; Darwin also checks
+the exact-closure handoff against real `nh` without activating a system.
 
 ## Run
 

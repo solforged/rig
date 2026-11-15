@@ -75,6 +75,10 @@ the selected configuration from that store path. Both the source and output
 are GC-rooted under Rig's state directory. `diff` compares the candidate with
 `/run/current-system`. `switch` passes that exact closure to `nh`, then verifies
 the active path. It does not update dependencies or pull a checkout.
+On Darwin, the adapter uses `nh --expr` with a configuration-shaped expression
+containing only `builtins.storePath` of that closure. `--impure` permits access
+to the existing store path; it does not reevaluate the checkout. NixOS passes
+the closure directly. Neither adapter substitutes a mutable flake installable.
 
 Run as your normal user. `nh` handles privilege elevation. An interrupted or
 failed activation records an unknown outcome, including any subsequent

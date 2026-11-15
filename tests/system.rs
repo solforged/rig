@@ -55,7 +55,16 @@ fn switch_activates_exact_closure() {
         .iter()
         .find(|a| a[0] == "nh" && !a.contains(&"--help".into()))
         .unwrap();
-    assert_eq!(activation[3], CLOSURE);
+    if f.host().platform == rig::inventory::Platform::Darwin {
+        let expression = activation
+            .windows(2)
+            .find(|args| args[0] == "--expr")
+            .unwrap();
+        assert!(expression[1].contains(CLOSURE));
+        assert!(activation.iter().any(|arg| arg == "--impure"));
+    } else {
+        assert_eq!(activation[3], CLOSURE);
+    }
     assert!(!activation.contains(&f.flake.to_string_lossy().into()));
 }
 #[test]
