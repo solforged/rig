@@ -1,0 +1,54 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@16f94ba7aae399b9f9077c254b6719ec6de7e3e3 # v3.24.2
+
+      - name: Build and test the native package
+        run: nix build .#checks.${{ matrix.system }}.package --no-link
+
+      - name: Check real Nix protocols without activation
+        run: nix develop --command cargo test --locked --test nix_smoke -- --ignored
+
+      - name: Check Rust formatting and lints
+        if: matrix.system == 'x86_64-linux'
+        run: |
+          nix develop --command cargo fmt --all -- --check
+          nix develop --command cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Check Nix formatting
+        if: matrix.system == 'x86_64-linux'
+        run: nix fmt -- --ci

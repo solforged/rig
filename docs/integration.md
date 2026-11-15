@@ -45,8 +45,8 @@ entry. Rig must require that ownership declaration before enabling deployment
 from an inventory that also exposes base configurations.
 
 Without a `rig` output, discovery uses the conventional configuration names
-for inspection only. Mutations require explicit ownership metadata. No inventory
-has been installed into the system flake as part of this implementation.
+for inspection only. Mutations require explicit ownership metadata in the
+managing flake; installing the Rig binary alone does not enable them.
 `NH_FLAKE` preserves the existing shell convention; `RIG_FLAKE` can override it.
 
 ## Source and live files

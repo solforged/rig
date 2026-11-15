@@ -13,6 +13,9 @@ switch tests.
 ## Run
 
 ```sh
+nix run github:solforged/rig -- --help
+
+# From a checkout:
 nix run . -- --help
 nix build
 ./result/bin/rig --version
@@ -62,6 +65,8 @@ repositories, and a loopback HTTP server for transfer-deadline checks. They
 never switch systems, collect garbage, or rekey secrets.
 The jj integration tests need both jj and Git; the Nix package supplies those
 inside its check environment.
+CI builds and tests the package natively on all three supported platforms and
+runs the real-Nix fixture checks without activation.
 
 ## Guides
 
