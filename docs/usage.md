@@ -159,6 +159,8 @@ native command, model hash, or task afterward, and nothing is retried.
   ignore SIGTERM stop too. Interactive elevation cannot be supervised this
   way; see the warning under
   [Build and activate locally](#build-and-activate-locally).
+  On Darwin, Rig reaps an exited child before rechecking a zombie-only group's
+  permission error; real signaling permission failures still stop cleanup.
 - Model verification, hashing, and transfers stop without publishing partial
   content.
 - Rig's own cleanup is the one exception. It still runs after cancellation,

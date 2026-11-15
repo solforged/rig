@@ -252,35 +252,69 @@ fn read_pipe(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<
     });
     rx
 }
-fn signal_group(pid: u32, signal: i32) -> io::Result<bool> {
-    let result = unsafe { libc::kill(-(pid as i32), signal) };
+fn signal_group(child: &mut Child, signal: i32) -> io::Result<bool> {
+    let pid = child.id();
+    let send = || unsafe { libc::kill(-(pid as i32), signal) };
+    let result = send();
     if result == 0 {
         return Ok(true);
     }
-    let error = io::Error::last_os_error();
+    let mut error = io::Error::last_os_error();
+    // Darwin reports EPERM for a zombie-only group. Reap our exited leader
+    // before checking again, but never swallow a genuine permission failure.
+    if error.raw_os_error() == Some(libc::EPERM) && child.try_wait()?.is_some() {
+        if send() == 0 {
+            return Ok(true);
+        }
+        error = io::Error::last_os_error();
+    }
     if error.raw_os_error() == Some(libc::ESRCH) {
         Ok(false)
     } else {
         Err(error)
     }
 }
-/// A group can outlive its leader. Check the group, not just Child::wait().
-pub fn stop_group(child: &mut Child, grace: Duration) -> Result<()> {
-    let pid = child.id();
-    if !signal_group(pid, libc::SIGTERM)? {
-        let _ = child.wait();
-        return Ok(());
-    }
+fn wait_group(child: &mut Child, grace: Duration) -> io::Result<bool> {
     let until = Instant::now() + grace;
-    while Instant::now() < until {
-        let _ = child.try_wait();
-        if !signal_group(pid, 0)? {
-            let _ = child.wait();
-            return Ok(());
+    loop {
+        let _ = child.try_wait()?;
+        match signal_group(child, 0) {
+            Ok(false) => return Ok(true),
+            // A zombie descendant may still be waiting for its parent to reap it.
+            Err(error) if error.raw_os_error() != Some(libc::EPERM) => return Err(error),
+            _ => {}
+        }
+        if Instant::now() >= until {
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(20));
     }
-    signal_group(pid, libc::SIGKILL)?;
+}
+/// A group can outlive its leader. Check the group, not just Child::wait().
+pub fn stop_group(child: &mut Child, grace: Duration) -> Result<()> {
+    match signal_group(child, libc::SIGTERM) {
+        Ok(false) => {
+            let _ = child.wait();
+            return Ok(());
+        }
+        Err(error) if error.raw_os_error() != Some(libc::EPERM) => return Err(error.into()),
+        _ => {}
+    }
+    if wait_group(child, grace)? {
+        let _ = child.wait();
+        return Ok(());
+    }
+    match signal_group(child, libc::SIGKILL) {
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            // Do not call an unsignalable group stopped unless it actually vanishes.
+            if !wait_group(child, grace)? {
+                return Err(error.into());
+            }
+        }
+        result => {
+            result?;
+        }
+    }
     let _ = child.wait();
     Ok(())
 }

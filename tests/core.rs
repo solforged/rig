@@ -336,3 +336,27 @@ fn terminal_hangup_is_cancellation() {
         refused.message
     );
 }
+
+#[test]
+fn stopping_an_exited_group_reaps_its_leader() {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "exit 0"]);
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = ChildGuard::new(command.spawn().unwrap(), true);
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+    // Observe exit without reaping: on Darwin this leaves an EPERM-only group.
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0
+    );
+    stop_group(&mut child, Duration::from_millis(100)).unwrap();
+    assert!(child.wait().unwrap().success());
+    child.armed = false;
+}
