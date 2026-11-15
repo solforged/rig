@@ -6,7 +6,11 @@ use rig::{
     system::find_executable,
 };
 use serde_json::json;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 struct Repo {
     fixture: Fixture,
@@ -79,7 +83,10 @@ impl Repo {
         })
     }
     fn clean(&self) {
-        assert_eq!(fs::read_dir(&self.root).unwrap().count(), 0);
+        self.clean_in(&self.root);
+    }
+    fn clean_in(&self, root: &Path) {
+        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
         assert!(!self.jj(&["workspace", "list"]).contains("rig-bump-"));
         let out = NativeRunner
             .run(
@@ -245,4 +252,87 @@ fn failed_build_does_not_apply_lock() {
         r.original
     );
     r.clean();
+}
+/// Backend whose `jj workspace forget` always fails.
+struct FailingForget<'a> {
+    backend: &'a FakeRunner,
+}
+impl Runner for FailingForget<'_> {
+    fn run(&self, command: Invocation) -> Result<Output> {
+        if command.argv.iter().any(|a| a == "forget") {
+            return Err(Error::runtime("jj exited with status 1"));
+        }
+        self.backend.run(command)
+    }
+    fn active_system(&self, path: &Path) -> Result<Option<String>> {
+        self.backend.active_system(path)
+    }
+}
+#[test]
+fn failed_forget_does_not_strand_the_workspace_directory() {
+    let Some(r) = Repo::new() else {
+        return;
+    };
+    *r.fixture.runner.fail.lock().unwrap() = Some("nix eval --raw".into());
+    let runner = FailingForget {
+        backend: &r.fixture.runner,
+    };
+    let mut ops = r.fixture.ops();
+    ops.runner = &runner;
+    let result = Bumper {
+        ops: &ops,
+        workspace_root: r.root.clone(),
+    }
+    .run(&BumpOptions {
+        inputs: vec![],
+        hosts: vec![],
+        eval_only: true,
+        no_commit: false,
+        message: None,
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read_dir(&r.root).unwrap().count(),
+        0,
+        "the directory must be removed even when forget fails"
+    );
+}
+#[test]
+fn cancelled_bump_forgets_and_removes_its_workspace() {
+    let Some(r) = Repo::new() else {
+        return;
+    };
+    let f = &r.fixture;
+    let update = f.temp.path().join("hang-update");
+    write_script(&update, ": > \"$RIG_FAKE_MARKER\"\nexec sleep 30");
+    let marker = f.temp.path().join("updating");
+    let mut command = rig_command(f, serde_json::to_value(&f.inventory).unwrap());
+    command
+        .args(["bump", "--eval-only", "--no-commit", "--json"])
+        .env("RIG_FAKE_UPDATE", &update)
+        .env("RIG_FAKE_MARKER", &marker)
+        .env("JJ_CONFIG", f.runner.jj_config.as_ref().unwrap());
+    let child = spawn(command);
+    // The marker proves the workspace exists and `nix flake update` is running in it.
+    wait_until(
+        "nix flake update to start in the workspace",
+        Duration::from_secs(60),
+        || marker.exists(),
+    );
+    let root = f.temp.path().join("home/.pi/wt");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    signal(&child, libc::SIGINT);
+    let output = finish(child, Duration::from_secs(60));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    r.clean_in(&root);
+    assert_eq!(
+        fs::read(f.flake.join("flake.lock")).unwrap(),
+        r.original,
+        "a cancelled bump must not touch the checkout"
+    );
 }

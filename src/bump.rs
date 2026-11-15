@@ -5,8 +5,11 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+/// Longest Rig's own workspace cleanup may run, even after cancellation.
+const CLEANUP_BOUND: Duration = Duration::from_secs(30);
 pub const CHECKS_EXPR: &str = "f: builtins.mapAttrs (_: outputs: builtins.mapAttrs (_: drvs: builtins.mapAttrs (_: drv: drv.drvPath) drvs) outputs) { checks = f.checks or {}; packages = f.packages or {}; }";
 pub struct BumpOptions {
     pub inputs: Vec<String>,
@@ -33,6 +36,16 @@ impl<'a, 'b> Bumper<'a, 'b> {
     }
     fn revision(&self, path: &Path) -> Result<String> {
         self.jj(&["log", "--no-graph", "-r", "@", "-T", "commit_id"], path)
+    }
+    /// Cleanup must survive the cancellation that triggered it, so it bypasses
+    /// the sticky flag instead of clearing it.
+    fn forget(&self, name: &str, flake: &Path) -> Result<()> {
+        self.ops.runner.run(
+            Invocation::new(["jj", "--no-pager", "workspace", "forget", name])
+                .cwd(flake)
+                .cleanup(CLEANUP_BOUND),
+        )?;
+        Ok(())
     }
     pub fn run(&self, options: &BumpOptions) -> Result<Value> {
         require(
@@ -295,19 +308,28 @@ impl<'a, 'b> Bumper<'a, 'b> {
             Ok(result)
         })();
         if completed || !validated {
-            let cleanup = (|| -> Result<()> {
-                if created {
-                    self.jj(&["workspace", "forget", &name], flake)?;
+            // Attempt both steps independently so one failure cannot strand the
+            // other. A cancelled `workspace add` can leave the directory behind.
+            let mut problems = Vec::new();
+            if created || workspace.exists() {
+                if let Err(error) = self.forget(&name, flake) {
+                    problems.push(format!(
+                        "`jj workspace forget {name}` in {} did not complete ({})",
+                        flake.display(),
+                        error.message
+                    ));
                 }
-                if workspace.exists() {
-                    fs::remove_dir_all(&workspace)?;
+            }
+            if workspace.exists() {
+                if let Err(error) = fs::remove_dir_all(&workspace) {
+                    problems.push(format!("could not remove the directory ({error})"));
                 }
-                Ok(())
-            })();
-            if cleanup.is_err() {
+            }
+            if !problems.is_empty() {
                 progress(format!(
-                    "workspace cleanup needs attention: {}",
-                    workspace.display()
+                    "workspace cleanup needs attention: {}: {}",
+                    workspace.display(),
+                    problems.join("; ")
                 ));
             }
         }

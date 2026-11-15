@@ -243,3 +243,91 @@ fn flake_path_is_explicit() {
     );
     assert!(flake_path(Some(&f.temp.path().join("missing"))).is_err());
 }
+#[test]
+fn fractional_time_limit_is_not_truncated() {
+    let spec = Invocation::new([shell().to_string_lossy().as_ref(), "-c", "sleep 30"])
+        .time_limit(Duration::from_millis(300));
+    let start = std::time::Instant::now();
+    assert!(NativeRunner.run(spec).is_err());
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "sub-second limit cut the command short: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "limit was ignored: {elapsed:?}"
+    );
+}
+#[test]
+fn cancellation_stops_new_commands_but_not_bounded_cleanup() {
+    if !isolated("cancellation_stops_new_commands_but_not_bounded_cleanup") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("mark");
+    // Long enough that the sticky flag is observed several times while running.
+    write_script(&script, "sleep 0.2; printf x > \"$1\"");
+    let mark = |file: &str| {
+        Invocation::new([
+            script.to_string_lossy().into_owned(),
+            temp.path().join(file).to_string_lossy().into_owned(),
+        ])
+    };
+    cancel_with(libc::SIGINT);
+    let refused = NativeRunner.run(mark("ordinary")).unwrap_err();
+    assert!(
+        refused.message.contains("not started"),
+        "{}",
+        refused.message
+    );
+    assert!(!temp.path().join("ordinary").exists());
+    NativeRunner
+        .run(mark("cleanup").cleanup(Duration::from_secs(10)))
+        .unwrap();
+    assert!(temp.path().join("cleanup").exists());
+    assert!(interrupted(), "cleanup must not clear the cancellation");
+}
+#[test]
+fn cleanup_after_cancellation_is_still_bounded() {
+    if !isolated("cleanup_after_cancellation_is_still_bounded") {
+        return;
+    }
+    cancel_with(libc::SIGTERM);
+    // `unlimited` cannot lift the cleanup bound, whatever the call order.
+    let slow = Invocation::new([shell().to_string_lossy().as_ref(), "-c", "sleep 30"])
+        .cleanup(Duration::from_millis(300))
+        .unlimited();
+    let start = std::time::Instant::now();
+    let error = NativeRunner.run(slow).unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(error.message.contains("timed out"), "{}", error.message);
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "cleanup was cancelled instead of run: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cleanup ran unbounded: {elapsed:?}"
+    );
+}
+#[test]
+fn terminal_hangup_is_cancellation() {
+    if !isolated("terminal_hangup_is_cancellation") {
+        return;
+    }
+    // Without a handler SIGHUP would terminate this process outright.
+    cancel_with(libc::SIGHUP);
+    let refused = NativeRunner
+        .run(Invocation::new([
+            shell().to_string_lossy().as_ref(),
+            "-c",
+            "exit 0",
+        ]))
+        .unwrap_err();
+    assert!(
+        refused.message.contains("not started"),
+        "{}",
+        refused.message
+    );
+}

@@ -13,23 +13,32 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn hash_file(path: &Path) -> Result<String> {
-    let meta = fs::symlink_metadata(path)?;
-    require(
-        meta.is_file() && !meta.file_type().is_symlink(),
-        "model file is missing or a symlink",
-    )?;
-    let mut file = File::open(path)?;
+/// Digest `reader`, stopping promptly if the operator cancels: models can be
+/// many gigabytes, and Ctrl-C must not wait for the whole file.
+pub fn hash_reader(reader: &mut impl Read) -> Result<String> {
     let mut hash = Sha256::new();
     let mut bytes = [0; 65536];
     loop {
-        let count = file.read(&mut bytes)?;
+        ensure_uninterrupted("model hashing interrupted")?;
+        let count = match reader.read(&mut bytes) {
+            Ok(count) => count,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
         if count == 0 {
             break;
         }
         hash.update(&bytes[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+pub fn hash_file(path: &Path) -> Result<String> {
+    let meta = fs::symlink_metadata(path)?;
+    require(
+        meta.is_file() && !meta.file_type().is_symlink(),
+        "model file is missing or a symlink",
+    )?;
+    hash_reader(&mut File::open(path)?)
 }
 fn download_client() -> Result<Client> {
     Client::builder()
@@ -129,6 +138,8 @@ impl<'a, 'b> Resources<'a, 'b> {
             result["reused"] = json!(true);
             return Ok(result);
         }
+        // A cancelled verification above is not "needs download".
+        ensure_uninterrupted("model fetch interrupted before transfer")?;
         let raw = model.url.as_ref().ok_or_else(|| {
             Error::refusal("model has no retrieval source; declare a pinned HTTPS or file URL")
         })?;
@@ -286,7 +297,7 @@ impl<'a, 'b> Resources<'a, 'b> {
                         .run(Invocation::new(args.clone()).timeout(5).unchecked())
                     {
                         Ok(output) => output.code == 0,
-                        Err(e) if e.code == 1 => false,
+                        Err(e) if e.code == 1 && !interrupted() => false,
                         Err(e) => return Err(e),
                     },
                 );
@@ -341,10 +352,13 @@ impl<'a, 'b> Resources<'a, 'b> {
             }
             args.push(Self::domain(service));
         }
-        self.ops
-            .runner
-            .run(Invocation::new(args).stream(Stream::Progress))?;
-        let until = Instant::now() + Duration::from_secs_f64(service.timeout);
+        let timeout = Duration::from_secs_f64(service.timeout);
+        self.ops.runner.run(
+            Invocation::new(args)
+                .stream(Stream::Progress)
+                .time_limit(timeout),
+        )?;
+        let until = Instant::now() + timeout;
         loop {
             let mut status = self.service_status(name, host, resource, action != "stop")?;
             if (action == "stop" && status["running"] == false)
@@ -460,6 +474,7 @@ impl<'a, 'b> Resources<'a, 'b> {
                 format!("required secret unavailable: {secret}"),
             )?;
         }
+        ensure_uninterrupted("task launch interrupted; nothing was started")?;
         let run = id("run");
         let directory = self.ops.state.dir(format!("runs/{run}"))?;
         let mut record = json!({"id": run, "host": name, "task": resource, "state": "starting", "startedAt": now(), "log": directory.join("output.log"), "artifacts": directory});
@@ -470,6 +485,11 @@ impl<'a, 'b> Resources<'a, 'b> {
             directory.join("output.log").display()
         ));
         let run_result = (|| -> Result<()> {
+            // Intent is recorded; cancellation arriving now must still prevent the spawn.
+            if interrupted() {
+                record["state"] = json!("cancelled");
+                return Ok(());
+            }
             let output = OpenOptions::new()
                 .write(true)
                 .create_new(true)

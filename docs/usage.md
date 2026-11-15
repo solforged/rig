@@ -133,10 +133,36 @@ A no-op creates no commit. Validation failure leaves the original checkout
 unchanged; a detected concurrent edit or application failure retains the
 validated workspace for review. Nothing is pushed or activated.
 
+If bump is cancelled or fails before validation completes, Rig forgets its jj
+workspace and removes the directory, even though the cancellation stays in
+force. The two steps are attempted independently. If either cannot finish, Rig
+reports the workspace path and what remains, such as running the printed
+`jj workspace forget` command in the checkout.
+
 Rig reads and displays global and repository commit-style files before
 committing. Its default message uses `chore(flake): bumped …` with a validation
 bullet. It does not interpret arbitrary prose policies; use `--message` when a
 repository requires another format. Existing jj signing policy still applies.
+
+## Cancellation and timeouts
+
+Ctrl-C, SIGTERM, and a closing terminal (SIGHUP) cancel the running command
+the same way. Cancellation is final for that process: Rig starts no further
+native command, model hash, or task afterward, and nothing is retried.
+
+- Supervised native commands and tasks run in their own process groups. Rig
+  sends SIGTERM, then SIGKILL after a short grace period, so descendants that
+  ignore SIGTERM stop too. Interactive elevation cannot be supervised this
+  way; see the warning under
+  [Build and activate locally](#build-and-activate-locally).
+- Model verification, hashing, and transfers stop without publishing partial
+  content.
+- Rig's own cleanup is the one exception. It still runs after cancellation,
+  but every cleanup command is limited to 30 seconds. Today that means
+  forgetting a bump workspace.
+- Status and inventory queries have short built-in limits. Builds, updates, and
+  activation run until they finish or you cancel them. Service and task
+  `timeout` values come from the declaration.
 
 ## Cleanup
 
@@ -179,8 +205,9 @@ Files are stored by digest under `$XDG_STATE_HOME/rig/models` (default
 space, enforce the size bound, and verify the digest before atomic replacement.
 Existing verified content is reused. HTTP, credential-bearing URLs, and HTTPS
 downgrades are refused. A single 24-hour deadline covers the HTTPS response,
-including a slowly trickling body. Ctrl-C cancels the transfer without
-publishing the partial file. No model is downloaded during activation or task
+including a slowly trickling body. Ctrl-C stops verification, hashing, and the
+transfer without publishing a partial file. No model is downloaded during
+activation or task
 startup.
 Model pruning and arbitrary destination paths are not implemented.
 
@@ -215,6 +242,12 @@ native running state and leaves application readiness unknown. `models =
 metadata, not something these runtime commands modify. Native sockets, timers,
 and other supervisors can still restart a stopped service.
 
+`timeout` is in seconds (fractions allowed, at most 3600, default 30). It
+limits the native `start`, `stop`, or `restart` command, then gives readiness
+polling a separate budget of the same duration. Individual status queries and
+probes retain their own limits. A native command still running at its deadline
+is stopped; inspect the service before retrying because it may keep starting.
+
 ## Foreground tasks
 
 A task declaration uses an absolute executable and working directory:
@@ -248,10 +281,14 @@ argument and environment values. Logs can still contain whatever the workload
 prints, so the task author must avoid credential leakage.
 
 Only one run per task per host is accepted. Missing prerequisites stop before
-launch, and failures are never retried automatically. Timeouts and Ctrl-C stop
-the process group. If the CLI disappears unexpectedly, an unfinished record is
-reported as unknown and blocks another run. Inspect the original process and
-its children before archiving that run directory; a recorded PID can be reused.
+launch, and failures are never retried automatically. A timeout, Ctrl-C,
+SIGTERM, or terminal hangup stops the whole process group, including
+descendants that ignore SIGTERM, and records `timed-out` or `cancelled`. A
+cancellation that arrives before launch, including while a model is being
+verified, starts nothing and leaves no run record. If the CLI disappears
+unexpectedly, such as after SIGKILL, an unfinished record is reported as
+unknown and blocks another run. Inspect the original process and its children
+before archiving that run directory; a recorded PID can be reused.
 
 Detached jobs, scheduling, `task cancel`, and automatic output retention are
 pending. Keep the CLI attached for these runs. A native timer may invoke the

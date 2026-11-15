@@ -68,35 +68,7 @@ fn current_directory_is_not_an_implicit_flake() {
     assert!(result["error"].as_str().unwrap().contains("select --flake"));
 }
 fn fake_cli(f: &Fixture, args: &[&str], data: Value) -> Output {
-    let bin = f.temp.path().join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let inv = f.temp.path().join("inventory.json");
-    fs::write(&inv, data.to_string()).unwrap();
-    write_script(
-        &bin.join("nix"),
-        r#"printf 'CALL %s\n' "$*" >> "$RIG_FAKE_LOG"
-case "$1:$2" in
-  eval:*) cat "$RIG_FAKE_INVENTORY" ;;
-  flake:archive) printf '%s\n' "$RIG_FAKE_SOURCE" ;;
-  hash:path) printf 'sha256-test\n' ;;
-  *) exit 99 ;;
-esac"#,
-    );
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_rig"))
-        .arg("--flake")
-        .arg(&f.flake)
-        .args(args)
-        .env("PATH", path)
-        .env("RIG_FAKE_INVENTORY", inv)
-        .env("RIG_FAKE_SOURCE", json!({"path":SOURCE}).to_string())
-        .env("RIG_FAKE_LOG", f.temp.path().join("calls"))
-        .env("XDG_STATE_HOME", f.temp.path().join("state-home"))
-        .output()
-        .unwrap()
+    rig_command(f, data).args(args).output().unwrap()
 }
 #[test]
 fn binary_queries_inventory_with_versioned_json() {

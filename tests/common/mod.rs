@@ -5,7 +5,10 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::Mutex,
+    thread,
+    time::{Duration, Instant},
 };
 
 pub const SOURCE: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source";
@@ -218,4 +221,115 @@ pub fn write_script(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
     fs::write(path, format!("#!{}\n{body}\n", shell().display())).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+/// Polls an observable condition; never a fixed sleep standing in for one.
+pub fn wait_until(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !ready() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+/// Cancellation is sticky for a process, so tests that trip it re-run
+/// themselves alone in a child copy of this test binary. Returns true only
+/// inside that child, where the test body should proceed.
+pub fn isolated(test: &str) -> bool {
+    if std::env::var("RIG_ISOLATED_TEST").is_ok_and(|v| v == test) {
+        return true;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env("RIG_ISOLATED_TEST", test)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "isolated test {test} failed ({}):\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+/// Delivers a real signal to this process and waits until Rig's handlers have
+/// recorded the cancellation.
+pub fn cancel_with(signal: i32) {
+    install_signals().unwrap();
+    assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+    wait_until(
+        "the signal to be recorded",
+        Duration::from_secs(5),
+        interrupted,
+    );
+}
+/// A name this machine answers to, exactly as the CLI selects local hosts.
+pub fn local_name() -> String {
+    local_names()
+        .unwrap()
+        .into_iter()
+        .filter(|name| safe_name(name).is_ok())
+        .min_by_key(String::len)
+        .expect("this machine needs a host name Rig accepts")
+}
+/// A `rig` command wired to a fake `nix` that serves `inventory`, with HOME,
+/// state and PATH confined to the fixture. `nix flake update` execs the script
+/// named by `RIG_FAKE_UPDATE`.
+pub fn rig_command(f: &Fixture, inventory: Value) -> Command {
+    let bin = f.temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let inventory_file = f.temp.path().join("inventory.json");
+    fs::write(&inventory_file, inventory.to_string()).unwrap();
+    write_script(
+        &bin.join("nix"),
+        r#"printf 'CALL %s\n' "$*" >> "$RIG_FAKE_LOG"
+case "$1:$2" in
+  eval:*) cat "$RIG_FAKE_INVENTORY" ;;
+  flake:archive) printf '%s\n' "$RIG_FAKE_SOURCE" ;;
+  flake:update) exec "$RIG_FAKE_UPDATE" ;;
+  hash:path) printf 'sha256-test\n' ;;
+  *) exit 99 ;;
+esac"#,
+    );
+    let home = f.temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rig"));
+    command
+        .arg("--flake")
+        .arg(&f.flake)
+        .env("PATH", path)
+        .env("HOME", home)
+        .env("RIG_FAKE_INVENTORY", inventory_file)
+        .env("RIG_FAKE_SOURCE", json!({"path": SOURCE}).to_string())
+        .env("RIG_FAKE_LOG", f.temp.path().join("calls"))
+        .env("XDG_STATE_HOME", f.temp.path().join("state-home"));
+    command
+}
+/// Starts a long-lived `rig` child whose exit the test controls.
+pub fn spawn(mut command: Command) -> Child {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+pub fn signal(child: &Child, signal: i32) {
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+}
+/// Waits for the child to exit; a hang kills it and fails the test.
+pub fn finish(mut child: Child, limit: Duration) -> std::process::Output {
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("process did not exit within {limit:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
 }

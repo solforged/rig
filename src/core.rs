@@ -67,8 +67,9 @@ pub fn require(condition: bool, message: impl Into<String>) -> Result<()> {
         Err(Error::refusal(message))
     }
 }
+/// Diagnostics only. A vanished terminal (hangup) must not abort cleanup.
 pub fn progress(message: impl fmt::Display) {
-    eprintln!("rig: {message}");
+    let _ = writeln!(io::stderr(), "rig: {message}");
 }
 pub fn uid() -> u32 {
     unsafe { libc::getuid() }
@@ -120,6 +121,17 @@ pub enum Stream {
     Progress,
     Stdout,
 }
+/// How a native command reacts once the operator has cancelled with Ctrl-C,
+/// SIGTERM, or terminal hangup. Cancellation is sticky for the life of the
+/// process and is never cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cancellation {
+    /// Ordinary work: not started after cancellation, stopped when cancelled mid-run.
+    Honor,
+    /// Cleanup of Rig's own state after cancellation. It still starts and runs,
+    /// but the bound applies even when the invocation asks to be unlimited.
+    Cleanup(Duration),
+}
 #[derive(Clone, Debug)]
 pub struct Invocation {
     pub argv: Vec<String>,
@@ -128,6 +140,7 @@ pub struct Invocation {
     pub stream: Stream,
     pub check: bool,
     pub env: BTreeMap<String, String>,
+    pub cancellation: Cancellation,
 }
 impl Invocation {
     pub fn new(args: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -138,6 +151,7 @@ impl Invocation {
             stream: Stream::Capture,
             check: true,
             env: BTreeMap::new(),
+            cancellation: Cancellation::Honor,
         }
     }
     pub fn cwd(mut self, path: impl AsRef<Path>) -> Self {
@@ -148,9 +162,26 @@ impl Invocation {
         self.timeout = Some(Duration::from_secs(seconds));
         self
     }
+    /// Sub-second precision for declared deadlines.
+    pub fn time_limit(mut self, limit: Duration) -> Self {
+        self.timeout = Some(limit);
+        self
+    }
     pub fn unlimited(mut self) -> Self {
         self.timeout = None;
         self
+    }
+    /// Run despite an earlier cancellation, for at most `bound`.
+    pub fn cleanup(mut self, bound: Duration) -> Self {
+        self.cancellation = Cancellation::Cleanup(bound);
+        self
+    }
+    /// The longest the command may run. Cleanup is never unbounded.
+    pub fn limit(&self) -> Option<Duration> {
+        match self.cancellation {
+            Cancellation::Honor => self.timeout,
+            Cancellation::Cleanup(bound) => Some(self.timeout.map_or(bound, |t| t.min(bound))),
+        }
     }
     pub fn stream(mut self, stream: Stream) -> Self {
         self.stream = stream;
@@ -183,14 +214,29 @@ pub fn run_json(runner: &dyn Runner, command: Invocation) -> Result<Value> {
 }
 
 static INTERRUPTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+/// Ctrl-C, termination, and terminal hangup request the same sticky
+/// cancellation, so each supervisor takes its normal stop-and-record path.
 pub fn install_signals() -> Result<()> {
     let flag = INTERRUPTED.get_or_init(|| Arc::new(AtomicBool::new(false)));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone())?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, flag.clone())?;
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        signal_hook::flag::register(signal, flag.clone())?;
+    }
     Ok(())
 }
 pub fn interrupted() -> bool {
     INTERRUPTED.get().is_some_and(|f| f.load(Ordering::Relaxed))
+}
+/// Call before starting work and between phases; `message` names what was prevented.
+pub fn ensure_uninterrupted(message: &str) -> Result<()> {
+    if interrupted() {
+        Err(Error::runtime(message))
+    } else {
+        Ok(())
+    }
 }
 pub struct NativeRunner;
 fn exit_code(status: ExitStatus) -> i32 {
@@ -280,6 +326,15 @@ impl Runner for NativeRunner {
     fn run(&self, spec: Invocation) -> Result<Output> {
         require(!spec.argv.is_empty(), "empty native command")?;
         let program = &spec.argv[0];
+        // Cancellation is sticky. Ordinary commands never start after it;
+        // bounded cleanup is the only exception.
+        let cancellable = spec.cancellation == Cancellation::Honor;
+        if cancellable && interrupted() {
+            return Err(Error::runtime(format!(
+                "{program} was not started: operation interrupted"
+            )));
+        }
+        let limit = spec.limit();
         let mut command = Command::new(program);
         command.args(&spec.argv[1..]).envs(&spec.env);
         if let Some(cwd) = &spec.cwd {
@@ -349,10 +404,8 @@ impl Runner for NativeRunner {
                     });
                 }
             }
-            if interrupted()
-                || spec
-                    .timeout
-                    .is_some_and(|timeout| started.elapsed() >= timeout)
+            if (cancellable && interrupted())
+                || limit.is_some_and(|limit| started.elapsed() >= limit)
             {
                 if grouped {
                     stop_group(&mut child, Duration::from_millis(300))?;

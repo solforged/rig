@@ -1,12 +1,17 @@
 mod common;
 use common::*;
-use rig::{inventory::*, resources::*};
-use serde_json::json;
+use rig::{
+    core::{Invocation, NativeRunner, Output, Result, Runner, Stream},
+    inventory::*,
+    resources::*,
+};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     os::unix::fs::{symlink, PermissionsExt},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -394,4 +399,243 @@ fn task_logs_reject_traversal() {
     assert!(Resources::new(&f.ops())
         .task_logs("local", f.host(), "../../secret", false)
         .is_err());
+}
+/// Streams zeros until cancelled and delivers SIGINT on its third read, so
+/// only cancellation can end the digest.
+struct CancelsMidStream {
+    reads: usize,
+}
+impl Read for CancelsMidStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reads += 1;
+        assert!(self.reads < 1000, "hashing ignored cancellation");
+        if self.reads == 3 {
+            cancel_with(libc::SIGINT);
+        }
+        buffer.fill(0);
+        Ok(buffer.len())
+    }
+}
+#[test]
+fn hashing_stops_mid_stream_when_cancelled() {
+    if !isolated("hashing_stops_mid_stream_when_cancelled") {
+        return;
+    }
+    let mut reader = CancelsMidStream { reads: 0 };
+    let error = hash_reader(&mut reader).unwrap_err();
+    assert!(error.message.contains("interrupted"), "{}", error.message);
+    assert_eq!(reader.reads, 3, "hashing continued after cancellation");
+}
+fn launchable_task(models: &[&str]) -> Fixture {
+    let mut f = model_fixture();
+    let script = f.temp.path().join("task");
+    write_script(&script, "printf x >> started");
+    f.inventory.hosts.get_mut("local").unwrap().tasks.insert(
+        "triage".into(),
+        Task {
+            argv: vec![script.to_string_lossy().into()],
+            cwd: f.temp.path().into(),
+            timeout: 5.0,
+            models: models.iter().map(ToString::to_string).collect(),
+            services: vec![],
+            secrets: Default::default(),
+            user: None,
+        },
+    );
+    f
+}
+#[test]
+fn task_never_starts_once_cancelled() {
+    if !isolated("task_never_starts_once_cancelled") {
+        return;
+    }
+    let hashed = launchable_task(&["triage"]);
+    Resources::new(&hashed.ops())
+        .fetch("local", hashed.host(), "triage")
+        .unwrap();
+    let direct = launchable_task(&[]);
+    cancel_with(libc::SIGINT);
+    // One task is cancelled while verifying its model, the other at launch.
+    for f in [&hashed, &direct] {
+        let error = Resources::new(&f.ops())
+            .task_run("local", f.host(), "triage")
+            .unwrap_err();
+        assert!(error.message.contains("interrupted"), "{}", error.message);
+        assert!(
+            !f.temp.path().join("started").exists(),
+            "the task started after cancellation"
+        );
+        assert!(
+            !f.state.root.join("runs").exists(),
+            "a cancelled launch must leave no run record"
+        );
+    }
+}
+/// Backend whose service mutations hang in a real process, so the native
+/// runner's own deadline is what ends them.
+struct HangingMutation<'a> {
+    backend: &'a FakeRunner,
+    hang: PathBuf,
+}
+impl Runner for HangingMutation<'_> {
+    fn run(&self, mut command: Invocation) -> Result<Output> {
+        if command.stream == Stream::Progress {
+            command.argv = vec![self.hang.to_string_lossy().into_owned()];
+            return NativeRunner.run(command);
+        }
+        self.backend.run(command)
+    }
+    fn active_system(&self, path: &Path) -> Result<Option<String>> {
+        self.backend.active_system(path)
+    }
+}
+#[test]
+fn hung_service_mutation_ends_at_the_declared_deadline() {
+    let mut f = service_fixture();
+    f.inventory
+        .hosts
+        .get_mut("local")
+        .unwrap()
+        .services
+        .get_mut("mail")
+        .unwrap()
+        .timeout = 0.4;
+    let hang = f.temp.path().join("hang");
+    write_script(&hang, "exec sleep 30");
+    let backend = HangingMutation {
+        backend: &f.runner,
+        hang,
+    };
+    let mut ops = f.ops();
+    ops.runner = &backend;
+    let start = Instant::now();
+    let error = Resources::new(&ops)
+        .service("local", f.host(), "mail", "start")
+        .unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(error.message.contains("timed out"), "{}", error.message);
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the declared timeout was truncated: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the 60 second default applied instead of the declared timeout: {elapsed:?}"
+    );
+}
+fn cli_inventory(tasks: Value, services: Value) -> Value {
+    let mut hosts = serde_json::Map::new();
+    hosts.insert(
+        local_name(),
+        json!({"platform": local_platform(), "managed": true, "tasks": tasks, "services": services}),
+    );
+    json!({"version": 1, "hosts": hosts})
+}
+#[test]
+fn hangup_cancels_task_and_stops_every_descendant() {
+    let f = Fixture::new();
+    let work = f.temp.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let script = f.temp.path().join("task");
+    // The descendant ignores TERM and is bounded, so a failure cannot leak it for long.
+    write_script(
+        &script,
+        "echo $$ > pid\n(trap '' TERM; n=0; while [ \"$n\" -lt 3000 ]; do printf x >> beat; n=$((n+1)); sleep 0.02; done) &\nwait",
+    );
+    let inventory = cli_inventory(
+        json!({"triage": {"argv": [script], "cwd": work, "timeout": 120}}),
+        json!({}),
+    );
+    let mut command = rig_command(&f, inventory);
+    let name = local_name();
+    command.args(["task", "run", "triage", "--on", name.as_str(), "--json"]);
+    let child = spawn(command);
+    let beat = work.join("beat");
+    wait_until(
+        "the task's descendant to start",
+        Duration::from_secs(60),
+        || fs::metadata(&beat).is_ok_and(|m| m.len() > 0),
+    );
+    signal(&child, libc::SIGHUP);
+    let output = finish(child, Duration::from_secs(30));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["results"][0]["details"]["state"], "cancelled");
+    let group: i32 = fs::read_to_string(work.join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_until(
+        "the task's process group to disappear",
+        Duration::from_secs(10),
+        || unsafe { libc::kill(-group, 0) } != 0,
+    );
+    let runs: Vec<_> = fs::read_dir(f.temp.path().join("state-home/rig/runs"))
+        .unwrap()
+        .collect();
+    assert_eq!(runs.len(), 1);
+    let record: Value = serde_json::from_slice(
+        &fs::read(runs[0].as_ref().unwrap().path().join("record.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "cancelled");
+}
+#[test]
+fn cancel_during_service_preflight_never_launches_task() {
+    let f = Fixture::new();
+    let work = f.temp.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let task = f.temp.path().join("task");
+    write_script(&task, "printf x >> started");
+    let probe = f.temp.path().join("probe");
+    write_script(&probe, ": > \"$RIG_FAKE_PROBING\"\nexec sleep 30");
+    let manager = if local_platform() == Platform::Darwin {
+        "launchd"
+    } else {
+        "systemd"
+    };
+    let inventory = cli_inventory(
+        json!({"triage": {"argv": [task], "cwd": work, "services": ["mail"]}}),
+        json!({"mail": {"manager": manager, "scope": "user", "unit": "dev.mail", "ready": [probe]}}),
+    );
+    let mut command = rig_command(&f, inventory);
+    let bin = f.temp.path().join("bin");
+    write_script(
+        &bin.join("systemctl"),
+        "printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\n'",
+    );
+    write_script(&bin.join("launchctl"), "printf 'state = running\\n'");
+    let probing = f.temp.path().join("probing");
+    let name = local_name();
+    command
+        .args(["task", "run", "triage", "--on", name.as_str(), "--json"])
+        .env("RIG_FAKE_PROBING", &probing);
+    let child = spawn(command);
+    wait_until(
+        "the readiness probe to start",
+        Duration::from_secs(60),
+        || probing.exists(),
+    );
+    signal(&child, libc::SIGINT);
+    let output = finish(child, Duration::from_secs(30));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = result["results"][0]["error"].as_str().unwrap();
+    assert!(
+        message.contains("interrupted"),
+        "cancellation was reported as: {message}"
+    );
+    assert!(!work.join("started").exists(), "the task started");
+    assert!(!f.temp.path().join("state-home/rig/runs").exists());
 }
